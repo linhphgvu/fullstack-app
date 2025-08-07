@@ -21,6 +21,6 @@ app.get('/api/hello', (req, res) => {
   res.json({ message: 'Hello from the backend!', environment: process.env.NODE_ENV });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
