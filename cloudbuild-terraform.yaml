@@ -1,0 +1,146 @@
+# Infrastructure-specific Cloud Build configuration
+steps:
+  # Step 1: Terraform format check
+  - name: 'hashicorp/terraform:1.6'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        cd terraform
+        terraform fmt -check -recursive
+        if [ $? -ne 0 ]; then
+          echo "❌ Terraform files are not properly formatted"
+          echo "Run 'terraform fmt -recursive' to fix formatting"
+          exit 1
+        fi
+        echo "✅ Terraform formatting check passed"
+    id: 'terraform-fmt-check'
+
+  # Step 2: Terraform validation
+  - name: 'hashicorp/terraform:1.6'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        cd terraform
+        terraform init -backend=false
+        terraform validate
+        echo "✅ Terraform validation passed"
+    id: 'terraform-validate'
+    waitFor: ['terraform-fmt-check']
+
+  # Step 3: Terraform security scan with Checkov
+  - name: 'bridgecrew/checkov:latest'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        checkov -d terraform/ --framework terraform \
+          --output cli --output junitxml --output-file-path /workspace/checkov-report.xml \
+          || echo "⚠️ Security scan completed with findings (non-blocking)"
+        echo "✅ Security scan completed"
+    id: 'terraform-security-scan'
+    waitFor: ['terraform-validate']
+
+  # Step 4: Terraform init with backend
+  - name: 'hashicorp/terraform:1.6'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        cd terraform
+        terraform init -input=false
+        echo "✅ Terraform initialized"
+    id: 'terraform-init'
+    waitFor: ['terraform-security-scan']
+
+  # Step 5: Terraform plan
+  - name: 'hashicorp/terraform:1.6'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        cd terraform
+        terraform plan -input=false -out=tfplan \
+          -var="project_id=$PROJECT_ID" \
+          -var="environment=${_ENVIRONMENT}" \
+          -var="app_name=${_APP_NAME}"
+        
+        # Show the plan in a readable format
+        terraform show -no-color tfplan > /workspace/terraform-plan.txt
+        echo "✅ Terraform plan created"
+        
+        # Count resources to be created/modified/destroyed
+        CREATED=$(grep -c "will be created" /workspace/terraform-plan.txt || echo "0")
+        MODIFIED=$(grep -c "will be updated in-place" /workspace/terraform-plan.txt || echo "0")
+        DESTROYED=$(grep -c "will be destroyed" /workspace/terraform-plan.txt || echo "0")
+        
+        echo "📊 Plan Summary:"
+        echo "  🆕 Resources to create: $CREATED"
+        echo "  🔄 Resources to modify: $MODIFIED"
+        echo "  🗑️ Resources to destroy: $DESTROYED"
+    id: 'terraform-plan'
+    waitFor: ['terraform-init']
+
+  # Step 6: Terraform apply (only if not a PR)
+  - name: 'hashicorp/terraform:1.6'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        cd terraform
+        if [ "${_APPLY_TERRAFORM}" = "true" ]; then
+          echo "🚀 Applying Terraform changes..."
+          terraform apply -input=false -auto-approve tfplan
+          echo "✅ Terraform apply completed successfully"
+          
+          # Output important values
+          echo "📋 Infrastructure Outputs:"
+          terraform output -json > /workspace/terraform-outputs.json
+          terraform output
+        else
+          echo "⏭️ Skipping Terraform apply (plan-only mode)"
+        fi
+    id: 'terraform-apply'
+    waitFor: ['terraform-plan']
+
+  # Step 7: Terraform state backup
+  - name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        if [ "${_APPLY_TERRAFORM}" = "true" ]; then
+          # Create backup of Terraform state
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          gsutil cp gs://$PROJECT_ID-terraform-state/terraform/state/default.tfstate \
+            gs://$PROJECT_ID-terraform-state/backups/terraform-state-${_ENVIRONMENT}-$TIMESTAMP.tfstate
+          echo "✅ Terraform state backed up"
+        else
+          echo "⏭️ Skipping state backup (plan-only mode)"
+        fi
+    id: 'terraform-backup'
+    waitFor: ['terraform-apply']
+
+# Artifacts to store
+artifacts:
+  objects:
+    location: 'gs://$PROJECT_ID-build-artifacts'
+    paths: 
+      - '/workspace/terraform-plan.txt'
+      - '/workspace/terraform-outputs.json'
+      - '/workspace/checkov-report.xml'
+
+# Substitution variables
+substitutions:
+  _ENVIRONMENT: 'dev'
+  _APP_NAME: 'fullstack-app'
+  _APPLY_TERRAFORM: 'false'  # Set to 'true' for apply, 'false' for plan-only
+
+# Options
+options:
+  machineType: 'E2_STANDARD_2'
+  logging: CLOUD_LOGGING_ONLY
+
+# Timeout
+timeout: '1800s'

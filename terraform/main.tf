@@ -107,8 +107,12 @@ resource "google_sql_database_instance" "main" {
   settings {
     tier = var.db_tier
     backup_configuration {
-      enabled = true
-      start_time = "3:00" 
+      enabled                        = true
+      start_time                    = "03:00"
+      point_in_time_recovery_enabled = var.environment == "prod" ? true : false
+      backup_retention_settings {
+        retained_backups = var.backup_retention_days
+      }
     }
     ip_configuration {
       ipv4_enabled = false
@@ -116,9 +120,9 @@ resource "google_sql_database_instance" "main" {
     }
     database_flags {
       name = "log_statement"
-      value = "all"
+      value = var.enable_debug_logging ? "all" : "none"
     }
-    deletion_protection_enabled = false #set this to true in prod env 
+    deletion_protection_enabled = var.deletion_protection
   }
   depends_on = [google_project_service.services,  
                 google_service_networking_connection.private_vpc_connection]
@@ -159,13 +163,17 @@ resource "google_cloud_run_service" "backend" {
           value = var.environment
         }
         env {
+          name  = "LOG_LEVEL"
+          value = var.enable_debug_logging ? "debug" : "info"
+        }
+        env {
           name = "DATABASE_URL"
           value = "postgresql://${google_sql_user.app_user.name}:${google_sql_user.app_user.password}@${google_sql_database_instance.main.private_ip_address}:5432/${google_sql_database.app_db.name}"
         }
         resources {
           limits = {
-            cpu    = "1000m"
-            memory = "512Mi"
+            cpu    = var.environment == "prod" ? "2000m" : "1000m"
+            memory = var.environment == "prod" ? "1Gi" : "512Mi"
           }
         }
       }
@@ -256,3 +264,33 @@ resource "google_project_iam_member" "cloudbuild_iam_admin" {
 data "google_project" "project" {
 }
  
+resource "google_monitoring_dashboard" "main" {
+  count        = var.enable_monitoring ? 1 : 0
+  dashboard_json = jsonencode({
+    displayName = "${var.app_name} - ${var.environment} Dashboard"
+    mosaicLayout = {
+      tiles = [
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "Cloud Run Request Count"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"cloud_run_revision\""
+                    aggregation = {
+                      alignmentPeriod  = "300s"
+                      perSeriesAligner = "ALIGN_RATE"
+                    }
+                  }
+                }
+              }]
+            }
+          }
+        }
+      ]
+    }
+  })
+}
